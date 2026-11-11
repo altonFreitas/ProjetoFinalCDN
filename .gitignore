@@ -11,3 +11,7 @@ guiaProjeto
 .idea/.*
 notas-relatorio.md
 README-defesa.md
+
+#kubectl port-forward svc/prometheus-server 9090:80 > ~/pf-prom.log 2>&1 &
+#kubectl port-forward svc/grafana 3000:80 > ~/pf-grafana.log 2>&1 &
+#--porta para ligar ao prometheus e grafana
