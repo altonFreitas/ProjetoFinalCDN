@@ -199,3 +199,48 @@ bash scripts/teste-comum.sh --reduzido
 
 **Porquê:** o `envFrom` só é lido quando o Pod arranca, por isso o `rollout restart` é obrigatório; o `printenv` em cada Pod prova o que o processo recebeu (o cabeçalho do teste lê o ConfigMap, não os Pods).
 **Resultado medido:** 0 erros em 14 268 pedidos, `OVERSOLD 0`, mas **`notifications 234, missing 266`**, `check notified: FAIL` (`resultados/teste-comum-20261111-221238-reduzido.txt`). Sem fila, as notificações da janela da falha perdem-se. Resultado **esperado**: justifica o `async`. **Repor `async` no fim** (ver abaixo).
+
+### (d) Apagar o Pod do RabbitMQ (`OUTBOX=on`, `async`)
+
+```bash
+# Terminal B
+kubectl get pods -l app=rabbitmq -w | tee resultados/r4d2-pods-watch.txt
+# Terminal D: outbox pendente, lida do próprio orders a cada segundo
+while true; do date +%T; kubectl exec deploy/orders -- node -e "fetch('http://localhost:3002/metrics').then(r=>r.text()).then(t=>console.log(t.split('\n').filter(l=>l.startsWith('orders_outbox_pending')).join('\n')))"; sleep 1; done | tee resultados/r4d2-outbox.txt
+# Terminal C: falha aos 3 s (as encomendas entram nos primeiros segundos)
+( sleep 3; kubectl delete pod -l app=rabbitmq ) &
+bash scripts/teste-comum.sh --reduzido
+```
+
+**Porquê:** `/metrics` do `orders` (`lib.js:99`) expõe `orders_outbox_pending` (linhas da outbox ainda por publicar); a falha tem de vir cedo, porque com 500 bilhetes as encomendas aceites entram nos primeiros segundos.
+**Resultado medido:** 0 erros em 17 542 pedidos, `OVERSOLD 0`, 500/500, `PASS` (`resultados/teste-comum-20261111-223843-reduzido.txt`). A outbox subiu a **500** (22:38:54–22:39:11) e voltou a **0** (22:39:14) quando o RabbitMQ voltou (`1/1` aos 19 s).
+**Porquê:** encomenda e mensagem na mesma transação; o `/ready` do `orders` não exige o broker; o relay só publica quando o broker responde. Nota: a 1.ª tentativa (falha aos 15 s, sem medir a outbox) não prova o mecanismo.
+
+### (f) Apagar `postgres-replica-0` e decisão sobre a réplica (liga ao R5)
+
+**Problema medido:** com `READ_DATABASE_URL` definido no `tickets`, o `/ready` inclui a réplica (`services/tickets/src/index.js:49`). Ao apagar a réplica, os 3 Pods do `tickets` deram `503` na readiness ao mesmo tempo e o Service ficou sem endpoints (falha parcial → total), embora o `POST /orders` não use a réplica.
+
+**Decisão (configuração final):** retirar `READ_DATABASE_URL` do `tickets`. Em `k8s/tickets.yaml`, **não** existe o bloco:
+```yaml
+            - name: READ_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: postgres, key: TICKETS_READ_DATABASE_URL }
+```
+(no pacote original está nas linhas 53-55; foi apagado). Depois de alterar: `kubectl apply -f k8s/tickets.yaml`, `kubectl rollout restart deployment/tickets`, `kubectl rollout status deployment/tickets`.
+
+**Verificação:**
+```bash
+kubectl get pods -l app=tickets -o name | xargs -I{} kubectl exec {} -- sh -c 'printenv READ_DATABASE_URL || echo "(sem READ_DATABASE_URL)"'   # ×3 sem variável
+curl -s -w '\n' http://localhost:8080/tickets/events/<eventId>    # "readFrom":"primary"
+```
+
+**Teste da falha:**
+```bash
+kubectl get pods -w | grep --line-buffered -E 'tickets|postgres-replica' | tee resultados/r4f3-pods-watch.txt   # Terminal B
+kubectl get endpoints tickets -w | tee resultados/r4f3-endpoints-watch.txt                                       # Terminal D
+( sleep 15; kubectl delete pod postgres-replica-0 ) &                                                           # Terminal C
+bash scripts/teste-comum.sh --reduzido
+```
+**Resultado medido (máquina libertada):** 0 erros em 27 720 pedidos, 614 req/s, p95 50,3 ms, `OVERSOLD 0`, `PASS` (`resultados/teste-comum-20261111-232018-reduzido.txt`); endpoints do `tickets` sempre 3. Custo da decisão: as leituras `GET /events/:id` vão ao primário (o alívio de leituras é nulo no teste comum).
+
+> ⚠️ Medir desempenho só com o portátil libertado (apps fechadas, ≥ ~35% de memória livre): com 8 GiB de RAM e 5,79 GiB no Docker, as corridas com a máquina cheia deram 85-110 req/s contra 548-614 req/s.
