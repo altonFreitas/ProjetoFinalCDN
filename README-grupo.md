@@ -138,3 +138,64 @@ bash scripts/teste-comum.sh --reduzido
 - O fluxo manual prova a cadeia inteira (Ingress → `orders` → `tickets` → Postgres → RabbitMQ → `notifications`).
 - O `PASS` verifica duas regras: **nenhum bilhete vendido acima da capacidade** (consistência, T05) e **exatamente uma notificação por encomenda** (mensagens/idempotência, T04).
 - Corre-se sempre com o **mesmo perfil** (`--reduzido`) e sem alterar os parâmetros do script.
+
+## 7. R4: resiliência (falhas sob carga)
+
+Antes de cada cenário: `kubectl get pods` todos `Running` e fila `order.created` a 0
+(`kubectl exec deploy/rabbitmq -- rabbitmqctl list_queues name messages_ready`).
+
+### (a) Apagar um Pod do `tickets`
+
+```bash
+# Terminal B (observar; um ficheiro por terminal)
+kubectl get pods -l app=tickets -w | tee resultados/r4a-pods-watch.txt
+# Terminal C (falha aos 15 s + teste comum)
+( sleep 15; kubectl get pod -l app=tickets -o name | head -1 | xargs kubectl delete ) &
+bash scripts/teste-comum.sh --reduzido
+```
+
+**Porquê:** o `sleep 15` garante que a carga já está a correr; `head -1 | xargs kubectl delete` apaga um Pod; o `watch` regista o ciclo de vida.
+**Resultado medido:** 0 erros em 15 167 pedidos, `OVERSOLD 0`, 500/500 notificações, `PASS` (`resultados/teste-comum-20261111-213609-reduzido.txt`). O Pod novo ficou `1/1` ao fim de 15 s; entretanto serviram 2 réplicas.
+**Porquê não houve erros:** réplicas (3) + `preStop` + readiness + retries do `orders` com o mesmo `requestId`.
+
+### (b) Apagar um Pod do `orders`
+
+```bash
+# Terminal B
+kubectl get pods -l app=orders -w | tee resultados/r4b-pods-watch.txt
+# Terminal C
+( sleep 15; kubectl get pod -l app=orders -o name | head -1 | xargs kubectl delete ) &
+bash scripts/teste-comum.sh --reduzido
+```
+
+**Porquê:** igual a (a), com `app=orders`. Aqui **ninguém repete** o pedido do cliente (o Traefik só tem `strip-prefix`, sem `retry`; o k6 não repete): a proteção é o `preStop: sleep 5` + a saída do Pod dos endpoints + as outras 2 réplicas.
+**Resultado medido:** 0 erros em 20 758 pedidos, `OVERSOLD 0`, 500/500 notificações, `PASS` (`resultados/teste-comum-20261111-215029-reduzido.txt`). Pod novo `1/1` aos 9 s; o antigo acabou em `Completed`.
+
+### (c) `notifications` a 0 réplicas, 30 s (`NOTIFY_MODE=async`)
+
+```bash
+# Terminal B: fila a cada 5 s (ficheiro próprio)
+while true; do date +%T; kubectl exec deploy/rabbitmq -- rabbitmqctl list_queues name messages_ready messages_unacknowledged; sleep 5; done | tee resultados/r4c-async-fila.txt
+# Terminal C
+( sleep 10; kubectl scale deployment/notifications --replicas=0; sleep 30; kubectl scale deployment/notifications --replicas=1 ) &
+bash scripts/teste-comum.sh --reduzido
+```
+
+**Porquê:** `scale --replicas=0` tira o consumidor; 30 s depois repõe-se. `list_queues ... messages_ready messages_unacknowledged` mostra as mensagens à espera e as entregues sem `ack`.
+**Resultado medido:** 0 erros em 13 104 pedidos, `OVERSOLD 0`, 500/500, `missing 0` (`waited 2s`), `PASS` (`resultados/teste-comum-20261111-215503-reduzido.txt`). A fila **congelou em 251** durante a falha e escoou depois (0 às 21:56:43).
+**Porquê não há erros:** em `async` o `orders` só publica; a fila durável + outbox + ack manual guardam as mensagens. O custo é **atraso** (falha silenciosa).
+
+### (c') Repetição com `NOTIFY_MODE=sync` (experiência piorada de propósito)
+
+```bash
+# editar k8s/orders.yaml linha 10 -> NOTIFY_MODE: sync
+kubectl apply -f k8s/orders.yaml
+kubectl rollout restart deployment/orders
+kubectl rollout status deployment/orders
+kubectl get pods -l app=orders -o name | xargs -I{} kubectl exec {} -- printenv NOTIFY_MODE   # tem de dar sync ×3
+( sleep 10; kubectl scale deployment/notifications --replicas=0; sleep 30; kubectl scale deployment/notifications --replicas=1 ) &
+bash scripts/teste-comum.sh --reduzido
+```
+
+**Porquê:** o `envFrom` só é lido quando o Pod arranca, por isso o `rollout restart` é obrigatório; o `printenv` em cada Pod prova o que o processo recebeu (o cabeçalho do teste lê o ConfigMap, não os Pods).
+**Resultado medido:** 0 erros em 14 268 pedidos, `OVERSOLD 0`, mas **`notifications 234, missing 266`**, `check notified: FAIL` (`resultados/teste-comum-20261111-221238-reduzido.txt`). Sem fila, as notificações da janela da falha perdem-se. Resultado **esperado**: justifica o `async`. **Repor `async` no fim** (ver abaixo).
